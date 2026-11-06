@@ -1,11 +1,16 @@
 package provider
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
+	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -53,7 +58,7 @@ func (p *GitLabProvider) ListPullRequestChanges(ctx context.Context, pr PullRequ
 func (p *GitLabProvider) ListPullRequests(ctx context.Context, repo Repository) ([]PullRequest, error) {
 	var prs []PullRequest
 
-	opts := scm.PullRequestListOptions{Page: 1, Size: defaultPageSize}
+	opts := scm.PullRequestListOptions{Page: 1, Size: defaultPageSize, Open: true}
 	for {
 		prList, res, err := p.client.PullRequests.List(ctx, repo.String(), &opts)
 		if err != nil {
@@ -82,17 +87,7 @@ func (p *GitLabProvider) ListPullRequests(ctx context.Context, repo Repository) 
 }
 
 func (p *GitLabProvider) AddCommentToPullRequest(ctx context.Context, pr PullRequest, body []byte) (*Comment, error) {
-	comment, _, err := p.client.PullRequests.CreateComment(ctx, pr.Repository.String(), pr.Number, &scm.CommentInput{
-		Body: string(body),
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to add comment to merge request: %w", err)
-	}
-
-	return &Comment{
-		ID:   comment.ID,
-		Link: comment.Link,
-	}, nil
+	return p.notesRequest(ctx, http.MethodPost, pr, 0, body)
 }
 
 func (p *GitLabProvider) GetLastComments(ctx context.Context, pr PullRequest, since time.Time) ([]*Comment, error) {
@@ -136,31 +131,145 @@ func (p *GitLabProvider) GetLastComments(ctx context.Context, pr PullRequest, si
 }
 
 func (p *GitLabProvider) UpdateCommentOfPullRequest(ctx context.Context, pr PullRequest, commentID int, body []byte) error {
-	comment, _, err := p.client.PullRequests.FindComment(ctx, pr.Repository.String(), pr.Number, commentID)
-
+	note, found, err := p.getNote(ctx, pr, commentID)
 	if err != nil {
-		if errors.Is(err, scm.ErrNotFound) {
-			_, _, err = p.client.PullRequests.CreateComment(ctx, pr.Repository.String(), pr.Number, &scm.CommentInput{
-				Body: string(body),
-			})
-		}
+		return err
+	}
+
+	// note deleted manually or already carries a plan — post a new one
+	if !found || strings.Contains(note.Body, "```hcl") {
+		_, err := p.notesRequest(ctx, http.MethodPost, pr, 0, body)
 
 		return err
 	}
 
-	if strings.Contains(comment.Body, "```hcl") {
-		_, _, err := p.client.PullRequests.CreateComment(ctx, pr.Repository.String(), pr.Number, &scm.CommentInput{
-			Body: string(body),
-		})
-
-		return err
-	}
-
-	_, _, err = p.client.PullRequests.EditComment(ctx, pr.Repository.String(), pr.Number, commentID, &scm.CommentInput{
-		Body: string(body),
-	})
+	_, err = p.notesRequest(ctx, http.MethodPut, pr, commentID, body)
 
 	return err
+}
+
+// getNote returns an MR note by ID. The second value reports whether it
+// exists: go-scm's GitLab driver does not map 404 to scm.ErrNotFound (only
+// the GitHub driver does), so the former errors.Is(scm.ErrNotFound) branch
+// was dead and a manually deleted note blocked plan comments forever.
+func (p *GitLabProvider) getNote(ctx context.Context, pr PullRequest, commentID int) (note gitlabNote, found bool, err error) {
+	httpClient, err := p.notesClient()
+	if err != nil {
+		return note, false, err
+	}
+
+	endpoint := fmt.Sprintf("https://%s/api/v4/projects/%s/merge_requests/%d/notes/%d",
+		p.hostname, url.PathEscape(pr.Repository.String()), pr.Number, commentID)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return note, false, fmt.Errorf("failed to build notes request: %w", err)
+	}
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return note, false, fmt.Errorf("failed to get comment from merge request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		_, _ = io.Copy(io.Discard, resp.Body)
+
+		return note, false, nil
+	}
+
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		_, _ = io.Copy(io.Discard, resp.Body)
+
+		return note, false, fmt.Errorf("failed to get comment from merge request: %s: %s", resp.Status, string(respBody))
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&note); err != nil {
+		return note, false, fmt.Errorf("failed to decode notes response: %w", err)
+	}
+
+	return note, true, nil
+}
+
+type gitlabNote struct {
+	ID   int    `json:"id"`
+	Body string `json:"body"`
+}
+
+// notesPhrase returns the verb phrase for error messages:
+// "add comment to" / "update comment in".
+func notesPhrase(method string) string {
+	if method == http.MethodPut {
+		return "update comment in"
+	}
+
+	return "add comment to"
+}
+
+// notesClient makes sure the provider went through Setup(): notesRequest and
+// getNote bypass go-scm and must reuse the client's transport chain
+// (PrivateToken or OAuth2) instead of an unauthenticated default client.
+func (p *GitLabProvider) notesClient() (*http.Client, error) {
+	if p.client == nil || p.client.Client == nil {
+		return nil, errors.New("gitlab provider is not set up: call Setup() first")
+	}
+
+	return p.client.Client, nil
+}
+
+// notesRequest creates (commentID == 0) or updates an MR note.
+// It bypasses go-scm: the driver passes the note text as a query parameter
+// (?body=...), and a full plan (tens of KB percent-encoded) breaks the
+// request — GitLab answers HTTP/2 GOAWAY ENHANCE_YOUR_CALM (oversized
+// request line). The note body goes as a JSON request body instead
+// (GitLab's limit is 1M characters, orders of magnitude above any plan).
+// Authentication (PrivateToken/OAuth2) already lives in the transport
+// chain of p.client.Client.
+func (p *GitLabProvider) notesRequest(ctx context.Context, method string, pr PullRequest, commentID int, body []byte) (*Comment, error) {
+	httpClient, err := p.notesClient()
+	if err != nil {
+		return nil, err
+	}
+
+	endpoint := fmt.Sprintf("https://%s/api/v4/projects/%s/merge_requests/%d/notes",
+		p.hostname, url.PathEscape(pr.Repository.String()), pr.Number)
+	if commentID != 0 {
+		endpoint += "/" + strconv.Itoa(commentID)
+	}
+
+	payload, err := json.Marshal(map[string]string{"body": string(body)})
+	if err != nil {
+		return nil, fmt.Errorf("failed to encode comment body: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, method, endpoint, bytes.NewReader(payload))
+	if err != nil {
+		return nil, fmt.Errorf("failed to build notes request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to %s merge request: %w", notesPhrase(method), err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		_, _ = io.Copy(io.Discard, resp.Body)
+
+		return nil, fmt.Errorf("failed to %s merge request: %s: %s", notesPhrase(method), resp.Status, string(respBody))
+	}
+
+	note := struct {
+		ID int `json:"id"`
+	}{}
+	if err := json.NewDecoder(resp.Body).Decode(&note); err != nil {
+		return nil, fmt.Errorf("failed to decode notes response: %w", err)
+	}
+
+	return &Comment{ID: note.ID}, nil
 }
 
 func (p *GitLabProvider) SetLogger(log logr.Logger) error {
